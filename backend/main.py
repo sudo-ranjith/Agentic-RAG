@@ -1,37 +1,42 @@
 import os, io, logging, time
 from datetime import datetime
 from typing import List, Dict, Any
-from fastapi import FastAPI, Body, UploadFile, File
+from fastapi import FastAPI, Body, UploadFile, File, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from retriever import Retriever
 from agents import Memory, Policy, Route, answer_rag, answer_code, answer_sql
+from telemetry import Telemetry  # ✅ NEW import
 from pypdf import PdfReader
 from docx import Document
 import sqlite3
-from fastapi import Query
+import json
 
-
-# Configure logging
+# ---------- Logging ----------
 log_dir = "logs"
 if not os.path.exists(log_dir):
     os.makedirs(log_dir)
 
+file_handler = logging.FileHandler(
+    f'{log_dir}/api_{datetime.now().strftime("%Y%m%d")}.log',
+    encoding="utf-8"  # ✅ file logs in UTF-8
+)
+stream_handler = logging.StreamHandler()  # console
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(f'{log_dir}/api_{datetime.now().strftime("%Y%m%d")}.log'),
-        logging.StreamHandler()
-    ]
+    handlers=[file_handler, stream_handler]
 )
 logger = logging.getLogger(__name__)
 
+
+# ---------- Config ----------
 load_dotenv()
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")]
 
-app = FastAPI(title="Agentic RAG (Lite) — Hybrid + RRF")
+app = FastAPI(title="Agentic RAG (Lite) — Hybrid + RRF + Telemetry")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -42,10 +47,13 @@ app.add_middleware(
 
 retriever = Retriever()
 memory = Memory()
-logger.info("Initialized Retriever and Memory services")
+telemetry = Telemetry()  # ✅ instantiate telemetry
+
+logger.info("Initialized Retriever, Memory, and Telemetry services")
 logger.info("=== API Server Starting ===")
 logger.info(f"CORS Origins: {CORS_ORIGINS}")
 
+# ---------- Schemas ----------
 class AskRequest(BaseModel):
     query: str
     session_id: str = "default"
@@ -55,135 +63,148 @@ class AskResponse(BaseModel):
     citations: List[Dict[str, Any]] = []
     route: str
 
+# ---------- Health ----------
 @app.get("/health")
 def health():
-    logger.debug("Health check requested")
     return {"status": "ok"}
 
-# ---------- Text ingestion (quick) ----------
+# ---------- Ingest ----------
 @app.post("/ingest")
 def ingest(text: str = Body(..., embed=True)):
     logger.info("Processing text ingestion request")
-    logger.debug(f"Text length: {len(text)} chars")
     try:
         n = retriever.add_texts([text], metadatas=[{"source": "api"}])
-        logger.info(f"Successfully ingested {n} documents")
         return {"added": n}
     except Exception as e:
-        logger.error(f"Ingestion failed: {str(e)}", exc_info=True)
+        logger.error(f"Ingestion failed: {e}", exc_info=True)
         raise
 
-# ---------- File upload & ingestion ----------
+# ---------- Upload ----------
 @app.post("/upload")
 async def upload(files: List[UploadFile] = File(...)):
     logger.info(f"Processing upload request for {len(files)} files")
     texts, metas = [], []
-    
     for f in files:
-        start_time = time.time()
         name = f.filename or "file"
-        logger.info(f"Processing file: {name}")
-        
+        start_time = time.time()
         try:
             content = await f.read()
             ext = (name.split(".")[-1] or "").lower()
-            logger.debug(f"File type: {ext}, size: {len(content)} bytes")
-
             if ext in ("txt", "md", "csv", "log"):
                 text = content.decode("utf-8", errors="ignore")
-                texts.append(text)
-                metas.append({"source": name})
-                logger.debug(f"Processed text file: {len(text)} chars")
-            elif ext in ("pdf",):
+            elif ext == "pdf":
                 reader = PdfReader(io.BytesIO(content))
-                pages = [p.extract_text() or "" for p in reader.pages]
-                text = "\n".join(pages)
-                texts.append(text)
-                metas.append({"source": name})
-                logger.debug(f"Processed PDF: {len(pages)} pages")
-            elif ext in ("docx",):
+                text = "\n".join([p.extract_text() or "" for p in reader.pages])
+            elif ext == "docx":
                 doc = Document(io.BytesIO(content))
                 text = "\n".join([p.text for p in doc.paragraphs])
-                texts.append(text)
-                metas.append({"source": name})
-                logger.debug(f"Processed DOCX: {len(text)} chars")
             else:
-                logger.warning(f"Unsupported file type: {ext}")
                 metas.append({"source": name, "skipped": True})
-                
-            duration = time.time() - start_time
-            logger.info(f"Processed {name} in {duration:.2f}s")
+                continue
+            texts.append(text); metas.append({"source": name})
+            logger.info(f"Processed {name} in {time.time()-start_time:.2f}s")
         except Exception as e:
-            logger.error(f"Failed to process {name}: {str(e)}", exc_info=True)
             metas.append({"source": name, "error": str(e)})
+            logger.error(f"Failed to process {name}: {e}", exc_info=True)
 
-    pairs = [(t, m) for t, m in zip(texts, metas) if t and not m.get("skipped")]
-    if pairs:
-        logger.info(f"Ingesting {len(pairs)} processed documents")
-        n = retriever.add_texts([p[0] for p in pairs], metadatas=[p[1] for p in pairs])
-    else:
-        n = 0
-        logger.warning("No valid documents to ingest")
-    
+    valid = [(t, m) for t, m in zip(texts, metas) if t and not m.get("skipped")]
+    n = retriever.add_texts([v[0] for v in valid], metadatas=[v[1] for v in valid]) if valid else 0
     return {"uploaded": len(files), "ingested": n, "metas": metas}
 
-# ---------- Ask: hybrid + RRF ----------
+# ---------- Ask ----------
 @app.post("/ask", response_model=AskResponse)
-def ask(payload: AskRequest):
+def ask(body: Dict[str, Any] = Body(...)):
+    """
+    Accepts flexible payloads:
+      - {"query": "text", "session_id": "default"}
+      - {"query": {"query":"text","session_id":"default"}}
+      - form-like where 'query' may be a JSON string
+    Normalizes to (query_text, session_id) and validates.
+    """
     req_id = f"req_{int(time.time())}"
-    logger.info(f"[{req_id}] Processing ask request for session: {payload.session_id}")
-    logger.debug(f"[{req_id}] Query: {payload.query}")
-    
+    logger.info(f"[{req_id}] Received /ask payload: keys={list(body.keys())}")
+
+    # Normalize payload
+    q_val = body.get("query")
+    session = body.get("session_id") or "default"
+
+    # If query missing entirely, try if body itself is a string (raw)
+    if q_val is None and isinstance(body, str):
+        q_val = body
+
+    # If query looks like a JSON string, try parsing
+    if isinstance(q_val, str):
+        q_text = q_val.strip()
+        if q_text.startswith("{") and q_text.endswith("}"):
+            try:
+                parsed = json.loads(q_text)
+                # If nested object: {"query": "...", "session_id": "..."} 
+                if isinstance(parsed, dict):
+                    if "query" in parsed:
+                        q_text = parsed.get("query")
+                        session = parsed.get("session_id", session)
+            except Exception:
+                # keep q_text as-is (plain string)
+                pass
+    elif isinstance(q_val, dict):
+        # nested object case
+        q_text = q_val.get("query") or q_val.get("text") or None
+        session = q_val.get("session_id", session)
+    else:
+        q_text = None
+
+    # Final validation
+    if not isinstance(q_text, str) or not q_text.strip():
+        logger.warning(f"[{req_id}] Invalid query payload: {q_val!r}")
+        raise HTTPException(status_code=422, detail=[{
+            "type": "string_type",
+            "loc": ["body", "query"],
+            "msg": "Input should be a valid string",
+            "input": q_val
+        }])
+
+    q_text = q_text.strip()
+    logger.info(f"[{req_id}] Normalized query='{q_text[:80]}' session_id={session}")
+
     try:
         start_time = time.time()
-        docs = retriever.hybrid_search(payload.query, k_dense=6, k_sparse=6, k_rrf=60, top_k=6)
-        logger.debug(f"[{req_id}] Retrieved {len(docs)} documents")
-        
+        docs = retriever.hybrid_search(q_text, k_dense=6, k_sparse=6, k_rrf=60, top_k=6)
         context = "\n\n".join(d["text"] for d in docs)
         citations = [{"doc_id": d["id"], "meta": d.get("meta", {}), "rrf": d.get("_rrf")} for d in docs]
-        
-        route = Policy.decide(payload.query)
-        logger.info(f"[{req_id}] Selected route: {route.value}")
-        
+
+        route = Policy.decide(q_text)
+        logger.info(f"[{req_id}] Route selected: {route.value}")
+
         if route == Route.CODE:
-            answer = answer_code(payload.query, context)
+            answer = answer_code(q_text, context, session_id=session)
         elif route == Route.SQL:
-            answer = answer_sql(payload.query)
+            answer = answer_sql(q_text, session_id=session)
         else:
-            answer = answer_rag(payload.query, context)
-            
-        memory.save(payload.session_id, payload.query, answer, citations)
-        
-        duration = time.time() - start_time
-        logger.info(f"[{req_id}] Request completed in {duration:.2f}s")
-        
+            answer = answer_rag(q_text, context, session_id=session)
+
+        memory.save(session, q_text, answer, citations)
+        logger.info(f"[{req_id}] Done in {time.time()-start_time:.2f}s route={route.value}")
         return AskResponse(answer=answer, citations=citations, route=route.value)
     except Exception as e:
-        logger.error(f"[{req_id}] Request failed: {str(e)}", exc_info=True)
+        logger.error(f"[{req_id}] Ask failed: {e}", exc_info=True)
         raise
 
+# ---------- DB Info ----------
 @app.get("/dbinfo")
 def dbinfo():
     logger.info("DB info requested")
-    # Dense (Chroma)
     try:
-        dense_count = retriever.count_dense()        # if your retriever exposes it
+        dense_count = retriever.count_dense() if hasattr(retriever, "count_dense") else None
     except Exception:
-        try:
-            dense_count = int(retriever.col.count()) # direct Chroma collection
-        except Exception as e:
-            logger.warning(f"count_dense failed: {e}")
-            dense_count = None
+        dense_count = None
 
-    # Sparse (SQLite)
     try:
         conn = sqlite3.connect(os.getenv("SQLITE_PATH", "./rag_memory.db"))
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM docs")
         sparse_count = cur.fetchone()[0]
         conn.close()
-    except Exception as e:
-        logger.warning(f"sparse count failed: {e}")
+    except Exception:
         sparse_count = None
 
     return {
@@ -196,107 +217,56 @@ def dbinfo():
         "sparse_db": {
             "name": "SQLite",
             "path": os.getenv("SQLITE_PATH", "./rag_memory.db"),
-            "tables": ["docs", "memories"],
+            "tables": ["docs", "memories", "transactions"],
             "doc_count": sparse_count,
         },
     }
 
+# ---------- Documents ----------
 @app.get("/documents")
 def docs(offset: int = 0, limit: int = 20):
-    logger.info(f"Docs list requested offset={offset} limit={limit}")
+    logger.info(f"Docs list offset={offset} limit={limit}")
     try:
-        # If your retriever has list_docs(), use it:
-        if hasattr(retriever, "list_docs"):
-            data = retriever.list_docs(offset=offset, limit=limit)
-            return {"offset": offset, "limit": limit, "total": data["total"], "items": data["items"]}
-
-        # Fallback: query SQLite directly
         conn = sqlite3.connect(os.getenv("SQLITE_PATH", "./rag_memory.db"))
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM docs")
         total = cur.fetchone()[0]
-        cur.execute(
-            "SELECT id, source, substr(text,1,500) FROM docs ORDER BY rowid DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        )
+        cur.execute("SELECT id, source, substr(text,1,500) FROM docs ORDER BY rowid DESC LIMIT ? OFFSET ?", (limit, offset))
         rows = [{"id": r[0], "source": r[1], "snippet": r[2]} for r in cur.fetchall()]
         conn.close()
         return {"offset": offset, "limit": limit, "total": total, "items": rows}
     except Exception as e:
-        logger.error(f"Docs list failed: {e}", exc_info=True)
-        return {"offset": offset, "limit": limit, "total": 0, "items": [], "error": str(e)}
+        logger.error(f"Docs fetch failed: {e}", exc_info=True)
+        return {"offset": offset, "limit": limit, "total": 0, "items": []}
 
-@app.get("/memory/{session_id}")
-def get_memory(session_id: str):
-    logger.info(f"Memory requested for session_id={session_id}")
+# ---------- Metrics Dashboard ----------
+@app.get("/metrics/summary")
+def metrics_summary(
+    since: str = Query(None, description="ISO datetime (UTC). Default last 30 days."),
+    until: str = Query(None, description="ISO datetime (UTC)."),
+):
     try:
-        conn = sqlite3.connect(os.getenv("SQLITE_PATH", "./rag_memory.db"))
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT ts, user, substr(assistant,1,400) AS assistant, citations
-            FROM memories WHERE session_id=?
-            ORDER BY ts DESC
-        """, (session_id,))
-        rows = cur.fetchall()
-        conn.close()
-        return {"session_id": session_id, "rows": rows}
+        return telemetry.summary(since=since, until=until)
     except Exception as e:
-        logger.error(f"Memory fetch failed: {e}", exc_info=True)
-        return {"session_id": session_id, "rows": [], "error": str(e)}
+        logger.error(f"Metrics summary failed: {e}", exc_info=True)
+        return {"input_tokens": 0, "output_tokens": 0, "guard_tokens_saved": 0, "guard_topics_count": 0}
 
-@app.post("/clear")
-def clear_all():
-    logger.warning("Clearing vector + sqlite stores (dev)")
-    # Chroma (vector) – clears all collections in the path
+@app.get("/metrics/by-model")
+def metrics_by_model(
+    since: str = Query(None),
+    until: str = Query(None),
+):
     try:
-        retriever.client.reset()
+        rows = telemetry.tokens_by_model_role(since=since, until=until)
+        return {"rows": rows}
     except Exception as e:
-        logger.warning(f"Chroma reset error: {e}")
+        logger.error(f"Metrics by model failed: {e}", exc_info=True)
+        return {"rows": []}
 
-    # SQLite (sparse + memories)
+@app.get("/metrics/recent")
+def metrics_recent(limit: int = 10):
     try:
-        conn = sqlite3.connect(os.getenv("SQLITE_PATH", "./rag_memory.db"))
-        cur = conn.cursor()
-        cur.execute("DELETE FROM docs")
-        cur.execute("DELETE FROM memories")
-        conn.commit()
-        conn.close()
-        return {"cleared": True}
+        return {"rows": telemetry.recent(limit=limit)}
     except Exception as e:
-        logger.error(f"Clear failed: {e}", exc_info=True)
-        return {"cleared": False, "error": str(e)}
-
-
-@app.get("/rerank-debug")
-def rerank_debug(q: str = Query(..., description="Query to debug ranking")):
-    logger.info(f"Rerank debug for q='{q}'")
-    try:
-        dense = retriever.search_dense(q, k=6)
-        sparse = retriever.search_bm25(q, k=6)
-        fused  = retriever._rrf(dense, sparse, k=60)
-        def slim(lst):
-            return [{
-                "id": d["id"],
-                "src": d.get("meta", {}).get("source"),
-                "rrf": d.get("_rrf"),
-                "text": (d["text"][:180] + "…") if len(d["text"]) > 200 else d["text"]
-            } for d in lst]
-        return {"dense": slim(dense), "sparse": slim(sparse), "fused": slim(fused[:6])}
-    except Exception as e:
-        logger.error(f"Rerank debug failed: {e}", exc_info=True)
-        return {"error": str(e)}
-
-@app.get("/models")
-def models():
-    try:
-        from agents import MODEL  # dict: rag/code/sql/fallback
-        return { "models": MODEL }
-    except Exception:
-        # Fallback to defaults you’re already using implicitly
-        return { "models": {
-            "rag": "mistral:7b-instruct",
-            "code": "Qwen2.5-Coder:latest",
-            "sql":  "sqlcoder:latest",
-            "fallback": "llama3:latest",
-        }}
-
+        logger.error(f"Metrics recent failed: {e}", exc_info=True)
+        return {"rows": []}
