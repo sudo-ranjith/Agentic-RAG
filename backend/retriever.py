@@ -280,6 +280,17 @@ class Retriever:
         out.sort(key=lambda x: x["_rrf"], reverse=True)
         return out
 
+    def fuse(self, dense: List[Dict[str, Any]], sparse: List[Dict[str, Any]], *, k_rrf: int = 60, top_k: int = 6) -> List[Dict[str, Any]]:
+        """Public helper that performs reciprocal rank fusion and truncates the result.
+
+        This is primarily used by the agentic orchestrator so it can expose
+        intermediate retrieval timings (dense, sparse, fusion) separately while
+        still relying on the same fusion logic that powers :meth:`hybrid_search`.
+        """
+
+        fused = self._rrf(dense, sparse, k=k_rrf)
+        return fused[:top_k]
+
     # ---------- Hybrid ----------
     def hybrid_search(
         self,

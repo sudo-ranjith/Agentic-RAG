@@ -3,10 +3,10 @@ from datetime import datetime
 from typing import List, Dict, Any
 from fastapi import FastAPI, Body, UploadFile, File, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from retriever import Retriever
-from agents import Memory, Policy, Route, answer_rag, answer_code, answer_sql
+from agents import Memory, AgenticRAG
 from telemetry import Telemetry  # ✅ NEW import
 from pypdf import PdfReader
 from docx import Document
@@ -48,6 +48,7 @@ app.add_middleware(
 retriever = Retriever()
 memory = Memory()
 telemetry = Telemetry()  # ✅ instantiate telemetry
+agent = AgenticRAG(retriever, memory, telemetry)
 
 logger.info("Initialized Retriever, Memory, and Telemetry services")
 logger.info("=== API Server Starting ===")
@@ -60,8 +61,13 @@ class AskRequest(BaseModel):
 
 class AskResponse(BaseModel):
     answer: str
-    citations: List[Dict[str, Any]] = []
+    citations: List[Dict[str, Any]] = Field(default_factory=list)
     route: str
+    plan: List[str] = Field(default_factory=list)
+    trace: List[Dict[str, Any]] = Field(default_factory=list)
+    memory: List[Dict[str, Any]] = Field(default_factory=list)
+    context: List[Dict[str, Any]] = Field(default_factory=list)
+    planner_notes: str | None = None
 
 # ---------- Health ----------
 @app.get("/health")
@@ -168,23 +174,11 @@ def ask(body: Dict[str, Any] = Body(...)):
 
     try:
         start_time = time.time()
-        docs = retriever.hybrid_search(q_text, k_dense=6, k_sparse=6, k_rrf=60, top_k=6)
-        context = "\n\n".join(d["text"] for d in docs)
-        citations = [{"doc_id": d["id"], "meta": d.get("meta", {}), "rrf": d.get("_rrf")} for d in docs]
-
-        route = Policy.decide(q_text)
-        logger.info(f"[{req_id}] Route selected: {route.value}")
-
-        if route == Route.CODE:
-            answer = answer_code(q_text, context, session_id=session)
-        elif route == Route.SQL:
-            answer = answer_sql(q_text, session_id=session)
-        else:
-            answer = answer_rag(q_text, context, session_id=session)
-
-        memory.save(session, q_text, answer, citations)
-        logger.info(f"[{req_id}] Done in {time.time()-start_time:.2f}s route={route.value}")
-        return AskResponse(answer=answer, citations=citations, route=route.value)
+        result = agent.run(q_text, session_id=session)
+        logger.info(
+            f"[{req_id}] Done in {time.time()-start_time:.2f}s route={result.get('route')} plan_steps={len(result.get('plan', []))}"
+        )
+        return AskResponse(**result)
     except Exception as e:
         logger.error(f"[{req_id}] Ask failed: {e}", exc_info=True)
         raise
